@@ -1,4 +1,4 @@
-package main
+package ca
 
 import (
 	"crypto/ecdsa"
@@ -6,23 +6,20 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
-	"crypto/sha512"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/base64"
 	"encoding/pem"
-	"errors"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"math/big"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/urfave/cli"
+	"golang.org/x/crypto/sha3"
 )
 
 type ECDSASignature struct {
@@ -39,6 +36,31 @@ func publicKey(priv interface{}) interface{} {
 	default:
 		return nil
 	}
+}
+
+func LoadECPrivateKey(fn string) interface{} {
+	keyPem, err := ioutil.ReadFile(fn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	keyBlock, _ := pem.Decode(keyPem)
+	priv, err := x509.ParseECPrivateKey(keyBlock.Bytes)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return priv
+}
+
+func LoadCertificate(fn string) *x509.Certificate {
+	certBlock, err := ioutil.ReadFile(fn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	certObj, err := x509.ParseCertificate(certBlock)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return certObj
 }
 
 func GenerateKey(fn string, alg string) interface{} {
@@ -98,8 +120,8 @@ func GenerateKey(fn string, alg string) interface{} {
 	return nil
 }
 
-func GenerateLocalCA(path string, alg string) (interface{}, *x509.Certificate) {
-	key := GenerateKey("", alg)
+func GenerateLocalCA(rootPath string, alg string) {
+	key := GenerateKey(path.Join(rootPath, "ca.key"), alg)
 
 	pubk, err := x509.MarshalPKIXPublicKey(publicKey(key))
 	if err != nil {
@@ -128,264 +150,75 @@ func GenerateLocalCA(path string, alg string) (interface{}, *x509.Certificate) {
 	certDer, err := x509.CreateCertificate(
 		rand.Reader, &template, &template, publicKey(key), key,
 	)
-
 	if err != nil {
 		log.Fatalf("Failed to create certificate: %s\n", err)
 	}
 
-	certFile, err := os.Create(path + "ca.crt")
-	if err != nil {
-		log.Fatal("Failed to open file for writing")
-	}
-	defer certFile.Close()
-
-	certFile.Write(certDer)
-	certFile.Sync()
-	return key, &template
+	ioutil.WriteFile(path.Join(rootPath, "ca.crt"), certDer, os.ModePerm)
 }
 
-func GenerateCert(pub, priv interface{}, cert_signer *x509.Certificate, cn string, ku x509.KeyUsage, filename string) {
-	sn, _ := ioutil.ReadFile("serial")
+func IssueCert(rootPath string, cn string, filename string) {
+	///??????///
+	key := LoadECPrivateKey(path.Join(rootPath, "ca.key"))
+	cert := LoadCertificate(path.Join(rootPath, "ca.crt"))
+
+	sn, err := ioutil.ReadFile(path.Join(rootPath, "serial"))
+	if err != nil {
+		sn = []byte{0x31}
+		ioutil.WriteFile(path.Join(rootPath, "serial"), sn, os.ModePerm)
+	}
 	s, _ := strconv.Atoi(string(sn))
+	pubk, err := x509.MarshalPKIXPublicKey(publicKey(key))
+	if err != nil {
+		log.Fatalf("Failed to marshal PK: %s\n", err)
+	}
+	if filename == "" {
+		filename = string(sn)
+	}
+	ski := sha1.Sum(pubk)
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(int64(s)),
 		Subject: pkix.Name{
 			CommonName:   cn,
-			Organization: []string{"Sirius Service"},
+			Organization: []string{"SafeChain"},
 		},
-		KeyUsage:  ku,
-		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(time.Hour * 24 * 365),
+		SubjectKeyId: ski[:],
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour * 24 * 365),
 	}
 	certDer, err := x509.CreateCertificate(
-		rand.Reader, &template, cert_signer, pub, priv,
+		rand.Reader, &template, cert, publicKey(key), key,
 	)
 	if err != nil {
 		log.Fatalf("Failed to create certificate: %s\n", err)
 	}
-
-	certBlock := pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: certDer,
-	}
-
-	certFile, err := os.Create(filename)
-	if err != nil {
-		log.Fatalf("Failed to open '%s' for writing: %s", filename, err)
-	}
-	defer func() {
-		certFile.Close()
-	}()
-
-	pem.Encode(certFile, &certBlock)
-	ioutil.WriteFile("serial", []byte(strconv.Itoa(s+1)), 0644)
+	ioutil.WriteFile(filename, certDer, os.ModePerm)
+	ioutil.WriteFile(path.Join(rootPath, "serial"), []byte(strconv.Itoa(s+1)), 0644)
 }
 
-func VerifySignature(b64signature, pemcert string, data []byte) bool {
-	derSignature, err := base64.StdEncoding.DecodeString(b64signature)
+func Sign(data []byte, priv interface{}) []byte {
+	hash := sha3.Sum256(data)
+	r, s, err := ecdsa.Sign(rand.Reader, priv.(*ecdsa.PrivateKey), hash[:])
 	if err != nil {
-		return false
+		log.Fatal(err)
 	}
+	sig := ECDSASignature{r, s}
+	sigDer, err := asn1.Marshal(sig)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return sigDer
+}
+
+func Verify(signature []byte, data []byte, cert *x509.Certificate) bool {
 	sig := ECDSASignature{}
-	_, err = asn1.Unmarshal(derSignature, &sig)
+	_, err := asn1.Unmarshal(signature, &sig)
 	if err != nil {
-		fmt.Print(err)
+		log.Print(err)
 		return false
 	}
-	hash := sha512.Sum384(data)
-	certBlock, rest := pem.Decode([]byte(pemcert))
-	if len(rest) > 0 {
-		return false
-	}
-	certObj, err := x509.ParseCertificate(certBlock.Bytes)
-	if err != nil {
-		return false
-	}
-	pubKey := certObj.PublicKey.(*ecdsa.PublicKey)
+	hash := sha3.Sum256(data)
+	pubKey := cert.PublicKey.(*ecdsa.PublicKey)
 	return ecdsa.Verify(pubKey, hash[:], sig.R, sig.S)
-}
-
-func main() {
-	/*switch os.Args[1] {
-	case "-g":
-		if len(os.Args) < 3 {
-			log.Fatal("No CN provided!")
-		}
-		fn := os.Args[2]
-		log.Printf("Generating an ECDSA P-384 Private Key to %s.key", fn)
-		keyPem, _ := ioutil.ReadFile("sirius.key")
-		certPem, _ := ioutil.ReadFile("sirius.crt")
-		keyBlock, _ := pem.Decode(keyPem)
-		certBlock, _ := pem.Decode(certPem)
-
-		priv, _ := x509.ParseECPrivateKey(keyBlock.Bytes)
-		cert, _ := x509.ParseCertificate(certBlock.Bytes)
-
-		ECKey := GenerateECKey(fn + ".key")
-		GenerateCert(&ECKey.PublicKey, priv, cert, fn, x509.KeyUsageDigitalSignature, fn+".crt")
-	case "-s":
-		var key, data string
-		if len(os.Args) < 4 {
-			log.Fatal("Invalid params!")
-		}
-		key = os.Args[2]
-		data = os.Args[3]
-		//cert := "Han Solo.crt"
-		//certPem, _ := ioutil.ReadFile(cert)
-
-		log.Printf("Signing %s with key %s", data, key)
-		keyPem, err := ioutil.ReadFile(key)
-		if err != nil {
-			log.Fatal(err)
-		}
-		dataRaw, err := ioutil.ReadFile(data)
-		if err != nil {
-			log.Fatal(err)
-		}
-		keyBlock, _ := pem.Decode(keyPem)
-		priv, err := x509.ParseECPrivateKey(keyBlock.Bytes)
-		if err != nil {
-			log.Fatal(err)
-		}
-		hash := sha512.Sum384(dataRaw)
-		r, s, err := ecdsa.Sign(rand.Reader, priv, hash[:])
-		if err != nil {
-			log.Fatal(err)
-		}
-		sig := ECDSASignature{r, s}
-		sigDer, err := asn1.Marshal(sig)
-		if err != nil {
-			log.Fatal(err)
-		}
-		sigb64 := base64.StdEncoding.EncodeToString(sigDer)
-
-		fmt.Println(sigb64)
-		//fmt.Print(VerifySignature(string(sigb64), string(certPem), dataRaw))
-	case "-v":
-		certFile := os.Args[2]
-		//fmt.Println(certFile)
-		signatureFile := os.Args[3]
-		dataFile := os.Args[4]
-		//sig := ECDSASignature{}
-		//keyPem, err := ioutil.ReadFile("Han Solo.key")
-		certPem, _ := ioutil.ReadFile(certFile)
-		data, _ := ioutil.ReadFile(dataFile)
-		signature, _ := ioutil.ReadFile(signatureFile)
-		//fmt.Println(certPem)
-		//fmt.Println(data)
-		//fmt.Println(signature)
-		fmt.Print(VerifySignature(string(signature), string(certPem), data))
-
-	}*/
-	app := cli.NewApp()
-
-	app.Commands = []cli.Command{
-		cli.Command{
-			Name:      "install",
-			Usage:     "generate and install root certificate to OS and web-browsers",
-			ArgsUsage: "[path to ssl context, i.e. writable folder to store key and certificates]",
-			Flags: []cli.Flag{
-				cli.BoolFlag{
-					Name:  "gen-only, g",
-					Usage: "only generate certificates without installing",
-				},
-				cli.StringFlag{
-					Name:  "alg, a",
-					Usage: "certificate algorithm; supported values are 'rsa' for PKCS#1 RSA with 2048bit key and 'ecdsa' for X9.62 ECDSA key on curve P256",
-					Value: "ecdsa",
-				},
-				cli.StringFlag{
-					Name:  "user, u",
-					Usage: "user name for installation, if not set default user is the current user",
-					Value: "",
-				},
-			},
-			Action: func(c *cli.Context) error {
-				path := c.Args().First()
-				if path == "" {
-					return errors.New("`path` not set")
-				}
-				if !strings.HasSuffix(path, "/") && !strings.HasSuffix(path, "\\") {
-					path = path + "/"
-				}
-				if !(c.String("alg") == "rsa" || c.String("alg") == "ecdsa") {
-					return errors.New("`alg` invalid")
-				}
-				GenerateSSLKeyPair(path, c.String("alg"))
-				fmt.Printf("Generate %s ssl context to `%s`: OK\n", c.String("alg"), path)
-
-				if !c.Bool("gen-only") {
-					cert, err := ioutil.ReadFile(path + "ca.crt")
-					if err != nil {
-						return err
-					}
-					err = InstallCertificateToSystemTrustedRoot(cert, c.String("user"))
-					if err != nil {
-						fmt.Printf("Error installing certificate to OS certstore: %s\n", err.Error())
-					} else {
-						fmt.Printf("Install certificate to OS certstore: OK\n")
-					}
-					err = InstallCertificateToFirefox(cert, c.String("user"))
-					if err != nil {
-						fmt.Printf("Error installing certificate to Firefox certstore: %s\n", err.Error())
-					} else {
-						fmt.Printf("Install certificate to Firefox certstore: OK\n")
-					}
-				}
-
-				return nil
-			},
-		},
-
-		cli.Command{
-			Name:      "remove",
-			Usage:     "remove certificates from OS and browsers",
-			ArgsUsage: "[path to ssl context, i.e. folder where root certificate could be found]",
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  "user, u",
-					Usage: "user name for installation, if not set default user is the current user",
-					Value: "",
-				},
-			},
-			Action: func(c *cli.Context) error {
-				path := c.Args().First()
-				if path == "" {
-					return errors.New("`path` not set")
-				}
-				if !strings.HasSuffix(path, "/") && !strings.HasSuffix(path, "\\") {
-					path = path + "/"
-				}
-				cert, err := ioutil.ReadFile(path + "ca.crt")
-				if err != nil {
-					return err
-				}
-				err = DeleteCertificateFromSystemTrustedRoot(cert, c.String("user"))
-				if err != nil {
-					fmt.Printf("Error removing certificate from OS certstore: %s\n", err.Error())
-				} else {
-					fmt.Printf("Remove certificate from OS certstore: OK\n")
-				}
-				err = DeleteCertificateFromFirefox(cert, c.String("user"))
-				if err != nil {
-					fmt.Printf("Error removing certificate from Firefox certstore: %s\n", err.Error())
-				} else {
-					fmt.Printf("Remove certificate from Firefox certstore: OK\n")
-				}
-				return nil
-			},
-		},
-	}
-	app.Copyright = "(c) 2019 - SafeChain"
-	app.Email = ""
-	app.Author = "Hrubiian Yevhen"
-	app.Usage = "minimal CA realization"
-	app.Name = "sefe-ca"
-	app.Description = "minimal CA realization"
-	app.Version = "1.0.0"
-
-	err := app.Run(os.Args)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
 }
