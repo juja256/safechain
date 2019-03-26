@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/juja256/safechain/ca"
 	"github.com/urfave/cli"
 )
 
@@ -43,7 +42,7 @@ func main() {
 				if !(c.String("alg") == "rsa" || c.String("alg") == "ecdsa") {
 					return errors.New("`alg` invalid")
 				}
-				ca.GenerateLocalCA(path, (c.String("alg")))
+				//ca.GenerateLocalCA(path, (c.String("alg")))
 				fmt.Printf("Generate %s root certificate to `%s`: OK\n", c.String("alg"), path)
 				return nil
 			},
@@ -71,20 +70,19 @@ func main() {
 					path = "certs"
 				}
 
-				ca.IssueCert()
+				//ca.IssueCert()
 				return nil
 			},
 		},
 		cli.Command{
-			Name:  "sign",
-			Usage: "sign a file",
-			Flags: []cli.Flag{
-				cli.StringFlag{
-					Name:  "key, k",
-					Usage: "path to key file",
-				},
-			},
-			ArgsUsage: "[path to file]",
+			Name:      "sign",
+			Usage:     "sign a file",
+			ArgsUsage: "[path to file] [path to key]",
+		},
+		cli.Command{
+			Name:      "verify",
+			Usage:     "verify an ES",
+			ArgsUsage: "[path to data file] [path to ES file] [path to certificate]",
 		},
 	}
 	err := app.Run(os.Args)

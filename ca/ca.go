@@ -16,7 +16,6 @@ import (
 	"os"
 	"path"
 	"strconv"
-	"strings"
 	"time"
 
 	"golang.org/x/crypto/sha3"
@@ -63,65 +62,77 @@ func LoadCertificate(fn string) *x509.Certificate {
 	return certObj
 }
 
-func GenerateKey(fn string, alg string) interface{} {
-	if strings.ToLower(alg) == "rsa" {
-		key, err := rsa.GenerateKey(rand.Reader, 2048)
-		if err != nil {
-			log.Fatalf("Failed to generate RSA key: %s\n", err)
-		}
-		if fn != "" {
-
-			keyBlock := pem.Block{
-				Type:  "RSA PRIVATE KEY",
-				Bytes: x509.MarshalPKCS1PrivateKey(key),
-			}
-
-			keyFile, err := os.Create(fn)
-			if err != nil {
-				log.Fatalf("Failed to open %s for writing: %s", fn, err)
-			}
-			defer func() {
-				keyFile.Close()
-			}()
-
-			pem.Encode(keyFile, &keyBlock)
-		}
-		return key
-	} else if strings.ToLower(alg) == "ecdsa" {
-		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			log.Fatalf("Failed to generate ECDSA key: %s\n", err)
-		}
-
-		if fn != "" {
-			keyDer, err := x509.MarshalECPrivateKey(key)
-			if err != nil {
-				log.Fatalf("Failed to serialize ECDSA key: %s\n", err)
-			}
-
-			keyBlock := pem.Block{
-				Type:  "EC PRIVATE KEY",
-				Bytes: keyDer,
-			}
-
-			keyFile, err := os.Create(fn)
-			if err != nil {
-				log.Fatalf("Failed to open %s for writing: %s", fn, err)
-			}
-			defer func() {
-				keyFile.Close()
-			}()
-
-			pem.Encode(keyFile, &keyBlock)
-		}
-
-		return key
+func GenerateKey(fn string, keylen int) interface{} {
+	var ec elliptic.Curve
+	switch keylen {
+	case 192:
+		// PM_NIST_P192
+		p192 := new(elliptic.CurveParams)
+		p192.P, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFFFFFFFFFFFF", 16)
+		p192.N, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFF99DEF836146BC9B1B4D22831", 16)
+		p192.B, _ = new(big.Int).SetString("64210519E59C80E70FA7E9AB72243049FEB8DEECC146B9B1", 16)
+		p192.Gx, _ = new(big.Int).SetString("188DA80EB03090F67CBF20EB43A18800F4FF0AFD82FF1012", 16)
+		p192.Gy, _ = new(big.Int).SetString("07192B95FFC8DA78631011ED6B24CDD573F977A11E794811", 16)
+		p192.BitSize = 192
+		ec = p192
+	case 224:
+		ec = elliptic.P224()
+	case 256:
+		ec = elliptic.P256()
+	case 384:
+		ec = elliptic.P384()
+	case 521:
+		ec = elliptic.P521()
+	default:
+		ec = elliptic.P256()
 	}
-	return nil
+	key, err := ecdsa.GenerateKey(ec, rand.Reader)
+	if err != nil {
+		log.Fatalf("Failed to generate ECDSA key: %s\n", err)
+	}
+
+	if fn != "" {
+		keyDer, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			log.Fatalf("Failed to serialize ECDSA key: %s\n", err)
+		}
+
+		keyBlock := pem.Block{
+			Type:  "EC PRIVATE KEY",
+			Bytes: keyDer,
+		}
+
+		keyFile, err := os.Create(fn)
+		if err != nil {
+			log.Fatalf("Failed to open %s for writing: %s", fn, err)
+		}
+		defer func() {
+			keyFile.Close()
+		}()
+		pem.Encode(keyFile, &keyBlock)
+	}
+	return key
 }
 
-func GenerateLocalCA(rootPath string, alg string) {
-	key := GenerateKey(path.Join(rootPath, "ca.key"), alg)
+type LocalCA struct {
+	path string
+}
+
+func CreateLocalCA(rootPath string) (ca *LocalCA) {
+	ca = new(LocalCA)
+	err := os.MkdirAll(path.Join(rootPath, "root"), os.ModePerm)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = os.MkdirAll(path.Join(rootPath, "certs"), os.ModePerm)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	key := GenerateKey(path.Join(rootPath, "root", "ca.key"), 521)
+	ca.path = rootPath
+
+	ioutil.WriteFile(path.Join(rootPath, "serial"), []byte{0x31}, os.ModePerm)
 
 	pubk, err := x509.MarshalPKIXPublicKey(publicKey(key))
 	if err != nil {
@@ -154,47 +165,57 @@ func GenerateLocalCA(rootPath string, alg string) {
 		log.Fatalf("Failed to create certificate: %s\n", err)
 	}
 
-	ioutil.WriteFile(path.Join(rootPath, "ca.crt"), certDer, os.ModePerm)
+	ioutil.WriteFile(path.Join(rootPath, "root", "ca.crt"), certDer, os.ModePerm)
+	return
 }
 
-func IssueCert(rootPath string, cn string, filename string) {
-	///??????///
-	key := LoadECPrivateKey(path.Join(rootPath, "ca.key"))
-	cert := LoadCertificate(path.Join(rootPath, "ca.crt"))
+func (ca *LocalCA) IssueCert(dn pkix.Name, pubk interface{}) {
+	cakey := LoadECPrivateKey(path.Join(ca.path, "root", "ca.crt"))
+	cacert := LoadCertificate(path.Join(ca.path, "root", "ca.crt"))
 
-	sn, err := ioutil.ReadFile(path.Join(rootPath, "serial"))
+	sn, err := ioutil.ReadFile(path.Join(ca.path, "serial"))
 	if err != nil {
 		sn = []byte{0x31}
-		ioutil.WriteFile(path.Join(rootPath, "serial"), sn, os.ModePerm)
+		ioutil.WriteFile(path.Join(ca.path, "serial"), sn, os.ModePerm)
 	}
 	s, _ := strconv.Atoi(string(sn))
-	pubk, err := x509.MarshalPKIXPublicKey(publicKey(key))
+
+	filename := string(sn)
+
+	pubkB, err := x509.MarshalPKIXPublicKey(pubk)
 	if err != nil {
 		log.Fatalf("Failed to marshal PK: %s\n", err)
 	}
-	if filename == "" {
-		filename = string(sn)
-	}
-	ski := sha1.Sum(pubk)
+	ski := sha1.Sum(pubkB)
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(int64(s)),
-		Subject: pkix.Name{
-			CommonName:   cn,
-			Organization: []string{"SafeChain"},
-		},
+		Subject:      dn,
 		SubjectKeyId: ski[:],
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(time.Hour * 24 * 365),
 	}
 	certDer, err := x509.CreateCertificate(
-		rand.Reader, &template, cert, publicKey(key), key,
+		rand.Reader, &template, cacert, pubk, cakey,
 	)
 	if err != nil {
 		log.Fatalf("Failed to create certificate: %s\n", err)
 	}
 	ioutil.WriteFile(filename, certDer, os.ModePerm)
-	ioutil.WriteFile(path.Join(rootPath, "serial"), []byte(strconv.Itoa(s+1)), 0644)
+	ioutil.WriteFile(path.Join(ca.path, "serial"), []byte(strconv.Itoa(s+1)), 0644)
+}
+
+func LoadLocalCA(p string) *LocalCA {
+	return &LocalCA{p}
+}
+
+func (ca *LocalCA) SearchBySN(sn int) *x509.Certificate {
+	c, e := ioutil.ReadFile(path.Join(ca.path, "certs", strconv.Itoa(sn)))
+	if e != nil {
+		return nil
+	}
+	cert, _ := x509.ParseCertificate(c)
+	return cert
 }
 
 func Sign(data []byte, priv interface{}) []byte {
