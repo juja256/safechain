@@ -6,10 +6,11 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
-	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -17,6 +18,8 @@ import (
 	"path"
 	"strconv"
 	"time"
+
+	"github.com/juja256/x509"
 
 	"golang.org/x/crypto/sha3"
 )
@@ -26,7 +29,7 @@ type ECDSASignature struct {
 	S *big.Int
 }
 
-func publicKey(priv interface{}) interface{} {
+func PublicKey(priv interface{}) interface{} {
 	switch k := priv.(type) {
 	case *rsa.PrivateKey:
 		return &k.PublicKey
@@ -43,7 +46,7 @@ func LoadECPrivateKey(fn string) interface{} {
 		log.Fatal(err)
 	}
 	keyBlock, _ := pem.Decode(keyPem)
-	priv, err := x509.ParseECPrivateKey(keyBlock.Bytes)
+	priv, err := parseECPrivateKey(keyBlock.Bytes)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -62,19 +65,164 @@ func LoadCertificate(fn string) *x509.Certificate {
 	return certObj
 }
 
+var (
+	oidNamedCurveP160 = asn1.ObjectIdentifier{1, 3, 132, 0, 30}
+	oidNamedCurveP192 = asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 1}
+	oidNamedCurveP224 = asn1.ObjectIdentifier{1, 3, 132, 0, 33}
+	oidNamedCurveP256 = asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 7}
+	oidNamedCurveP384 = asn1.ObjectIdentifier{1, 3, 132, 0, 34}
+	oidNamedCurveP521 = asn1.ObjectIdentifier{1, 3, 132, 0, 35}
+)
+
+func oidFromNamedCurve(curve elliptic.Curve) (asn1.ObjectIdentifier, bool) {
+	switch curve.Params().BitSize {
+	case 160:
+		return oidNamedCurveP160, true
+	case 192:
+		return oidNamedCurveP192, true
+	case 224:
+		return oidNamedCurveP224, true
+	case 256:
+		return oidNamedCurveP256, true
+	case 384:
+		return oidNamedCurveP384, true
+	case 521:
+		return oidNamedCurveP521, true
+	}
+	return nil, false
+}
+
+func namedCurveFromOID(oid asn1.ObjectIdentifier) elliptic.Curve {
+	switch {
+	case oid.Equal(oidNamedCurveP160):
+		return p160()
+	case oid.Equal(oidNamedCurveP192):
+		return p192()
+	case oid.Equal(oidNamedCurveP224):
+		return elliptic.P224()
+	case oid.Equal(oidNamedCurveP256):
+		return elliptic.P256()
+	case oid.Equal(oidNamedCurveP384):
+		return elliptic.P384()
+	case oid.Equal(oidNamedCurveP521):
+		return elliptic.P521()
+	}
+	return nil
+}
+
+type ecPrivateKey struct {
+	Version       int
+	PrivateKey    []byte
+	NamedCurveOID asn1.ObjectIdentifier `asn1:"optional,explicit,tag:0"`
+	PublicKey     asn1.BitString        `asn1:"optional,explicit,tag:1"`
+}
+
+// marshalECPrivateKey marshals an EC private key into ASN.1, DER format and
+// sets the curve ID to the given OID, or omits it if OID is nil.
+func marshalECPrivateKeyWithOID(key *ecdsa.PrivateKey, oid asn1.ObjectIdentifier) ([]byte, error) {
+	privateKeyBytes := key.D.Bytes()
+	paddedPrivateKey := make([]byte, (key.Curve.Params().N.BitLen()+7)/8)
+	copy(paddedPrivateKey[len(paddedPrivateKey)-len(privateKeyBytes):], privateKeyBytes)
+
+	return asn1.Marshal(ecPrivateKey{
+		Version:       1,
+		PrivateKey:    paddedPrivateKey,
+		NamedCurveOID: oid,
+		PublicKey:     asn1.BitString{Bytes: elliptic.Marshal(key.Curve, key.X, key.Y)},
+	})
+}
+
+// marshalECPrivateKey marshals an EC private key into ASN.1, DER format.
+func marshalCustomECPrivateKey(key *ecdsa.PrivateKey) ([]byte, error) {
+	oid, ok := oidFromNamedCurve(key.Curve)
+	if !ok {
+		return nil, errors.New("x509: unknown elliptic curve")
+	}
+
+	return marshalECPrivateKeyWithOID(key, oid)
+}
+
+func p160() elliptic.Curve {
+	p160 := new(elliptic.CurveParams)
+	p160.P, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFAC73", 16)
+	p160.N, _ = new(big.Int).SetString("100000000000000000000351EE786A818F3A1A16B", 16)
+	p160.B, _ = new(big.Int).SetString("B4E134D3FB59EB8BAB57274904664D5AF50388BA", 16)
+	p160.Gx, _ = new(big.Int).SetString("52DCB034293A117E1F4FF11B30F7199D3144CE6D", 16)
+	p160.Gy, _ = new(big.Int).SetString("FEAFFEF2E331F296E071FA0DF9982CFEA7D43F2E", 16)
+	p160.BitSize = 160
+	return p160
+}
+
+func p192() elliptic.Curve {
+	p192 := new(elliptic.CurveParams)
+	p192.P, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFFFFFFFFFFFF", 16)
+	p192.N, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFF99DEF836146BC9B1B4D22831", 16)
+	p192.B, _ = new(big.Int).SetString("64210519E59C80E70FA7E9AB72243049FEB8DEECC146B9B1", 16)
+	p192.Gx, _ = new(big.Int).SetString("188DA80EB03090F67CBF20EB43A18800F4FF0AFD82FF1012", 16)
+	p192.Gy, _ = new(big.Int).SetString("07192B95FFC8DA78631011ED6B24CDD573F977A11E794811", 16)
+	p192.BitSize = 192
+	return p192
+}
+
+const ecPrivKeyVersion = 1
+
+// parseECPrivateKey parses an ASN.1 Elliptic Curve Private Key Structure.
+// The OID for the named curve may be provided from another source (such as
+// the PKCS8 container) - if it is provided then use this instead of the OID
+// that may exist in the EC private key structure.
+func parseECPrivateKey(der []byte) (key *ecdsa.PrivateKey, err error) {
+	var privKey ecPrivateKey
+	if _, err := asn1.Unmarshal(der, &privKey); err != nil {
+		return nil, errors.New("x509: failed to parse EC private key: " + err.Error())
+	}
+	if privKey.Version != ecPrivKeyVersion {
+		return nil, fmt.Errorf("x509: unknown EC private key version %d", privKey.Version)
+	}
+
+	var curve elliptic.Curve
+
+	curve = namedCurveFromOID(privKey.NamedCurveOID)
+
+	if curve == nil {
+		return nil, errors.New("x509: unknown elliptic curve")
+	}
+
+	k := new(big.Int).SetBytes(privKey.PrivateKey)
+	curveOrder := curve.Params().N
+	if k.Cmp(curveOrder) >= 0 {
+		return nil, errors.New("x509: invalid elliptic curve private key value")
+	}
+	priv := new(ecdsa.PrivateKey)
+	priv.Curve = curve
+	priv.D = k
+
+	privateKey := make([]byte, (curveOrder.BitLen()+7)/8)
+
+	// Some private keys have leading zero padding. This is invalid
+	// according to [SEC1], but this code will ignore it.
+	for len(privKey.PrivateKey) > len(privateKey) {
+		if privKey.PrivateKey[0] != 0 {
+			return nil, errors.New("x509: invalid private key length")
+		}
+		privKey.PrivateKey = privKey.PrivateKey[1:]
+	}
+
+	// Some private keys remove all leading zeros, this is also invalid
+	// according to [SEC1] but since OpenSSL used to do this, we ignore
+	// this too.
+	copy(privateKey[len(privateKey)-len(privKey.PrivateKey):], privKey.PrivateKey)
+	priv.X, priv.Y = curve.ScalarBaseMult(privateKey)
+
+	return priv, nil
+}
+
 func GenerateKey(fn string, keylen int) interface{} {
 	var ec elliptic.Curve
 	switch keylen {
+	case 160:
+		ec = p160()
 	case 192:
-		// PM_NIST_P192
-		p192 := new(elliptic.CurveParams)
-		p192.P, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFFFFFFFFFFFF", 16)
-		p192.N, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFF99DEF836146BC9B1B4D22831", 16)
-		p192.B, _ = new(big.Int).SetString("64210519E59C80E70FA7E9AB72243049FEB8DEECC146B9B1", 16)
-		p192.Gx, _ = new(big.Int).SetString("188DA80EB03090F67CBF20EB43A18800F4FF0AFD82FF1012", 16)
-		p192.Gy, _ = new(big.Int).SetString("07192B95FFC8DA78631011ED6B24CDD573F977A11E794811", 16)
-		p192.BitSize = 192
-		ec = p192
+		ec = p192()
 	case 224:
 		ec = elliptic.P224()
 	case 256:
@@ -92,7 +240,7 @@ func GenerateKey(fn string, keylen int) interface{} {
 	}
 
 	if fn != "" {
-		keyDer, err := x509.MarshalECPrivateKey(key)
+		keyDer, err := marshalCustomECPrivateKey(key)
 		if err != nil {
 			log.Fatalf("Failed to serialize ECDSA key: %s\n", err)
 		}
@@ -134,7 +282,7 @@ func CreateLocalCA(rootPath string) (ca *LocalCA) {
 
 	ioutil.WriteFile(path.Join(rootPath, "serial"), []byte{0x31}, os.ModePerm)
 
-	pubk, err := x509.MarshalPKIXPublicKey(publicKey(key))
+	pubk, err := x509.MarshalPKIXPublicKey(PublicKey(key))
 	if err != nil {
 		log.Fatalf("Failed to marshal PK: %s\n", err)
 	}
@@ -159,7 +307,7 @@ func CreateLocalCA(rootPath string) (ca *LocalCA) {
 	}
 
 	certDer, err := x509.CreateCertificate(
-		rand.Reader, &template, &template, publicKey(key), key,
+		rand.Reader, &template, &template, PublicKey(key), key,
 	)
 	if err != nil {
 		log.Fatalf("Failed to create certificate: %s\n", err)
@@ -170,7 +318,7 @@ func CreateLocalCA(rootPath string) (ca *LocalCA) {
 }
 
 func (ca *LocalCA) IssueCert(dn pkix.Name, pubk interface{}) {
-	cakey := LoadECPrivateKey(path.Join(ca.path, "root", "ca.crt"))
+	cakey := LoadECPrivateKey(path.Join(ca.path, "root", "ca.key"))
 	cacert := LoadCertificate(path.Join(ca.path, "root", "ca.crt"))
 
 	sn, err := ioutil.ReadFile(path.Join(ca.path, "serial"))
@@ -180,7 +328,7 @@ func (ca *LocalCA) IssueCert(dn pkix.Name, pubk interface{}) {
 	}
 	s, _ := strconv.Atoi(string(sn))
 
-	filename := string(sn)
+	filename := string(sn) + ".crt"
 
 	pubkB, err := x509.MarshalPKIXPublicKey(pubk)
 	if err != nil {
@@ -201,7 +349,7 @@ func (ca *LocalCA) IssueCert(dn pkix.Name, pubk interface{}) {
 	if err != nil {
 		log.Fatalf("Failed to create certificate: %s\n", err)
 	}
-	ioutil.WriteFile(filename, certDer, os.ModePerm)
+	ioutil.WriteFile(path.Join(ca.path, "certs", filename), certDer, os.ModePerm)
 	ioutil.WriteFile(path.Join(ca.path, "serial"), []byte(strconv.Itoa(s+1)), 0644)
 }
 
