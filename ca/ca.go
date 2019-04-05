@@ -40,7 +40,7 @@ func PublicKey(priv interface{}) interface{} {
 	}
 }
 
-func LoadECPrivateKey(fn string) interface{} {
+func LoadECPrivateKey(fn string) *ecdsa.PrivateKey {
 	keyPem, err := ioutil.ReadFile(fn)
 	if err != nil {
 		log.Fatal(err)
